@@ -114,6 +114,13 @@ class CodingMemoryStore:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
             if "vec" not in cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN vec BLOB")
+            # Add 幂等登记表:平台重试会带同一 request_id,重复请求直接视为成功
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS adds(
+                       request_id TEXT PRIMARY KEY,
+                       user_id TEXT NOT NULL,
+                       created_at TEXT NOT NULL)"""
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON chunks(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sess ON chunks(user_id, session_id)")
 
@@ -125,8 +132,27 @@ class CodingMemoryStore:
         return {"chunks": row[0], "users": row[1], "sessions": row[2]}
 
     # ---------- Add ----------
-    def add(self, user_id: str, session_id: str, messages: list[dict]) -> int:
-        """同步写入并提交;返回写入块数。失败抛异常 -> 上层 5xx,不会假成功。"""
+    def add(self, user_id: str, session_id: str, messages: list[dict], request_id: str | None = None) -> int:
+        """同步写入并提交;返回写入块数。失败抛异常 -> 上层 5xx,不会假成功。
+
+        幂等:平台对 Add 的重试保持同一 request_id(官方错误处理规范),
+        已登记过的 request_id 直接返回成功,不重复写入。
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with self._lock:
+            with self._conn() as conn:
+                try:
+                    conn.execute(
+                        "INSERT INTO adds(request_id, user_id, created_at) VALUES(?,?,?)",
+                        (request_id, user_id, now),
+                    )
+                except sqlite3.IntegrityError:
+                    return 0  # 重试请求:逻辑上已成功,幂等返回
+            return self._write_chunks(user_id, session_id, messages, request_id)
+
+    def _write_chunks(self, user_id: str, session_id: str, messages: list[dict], request_id: str) -> int:
         rows: list[tuple] = []
         mem_chunks: list[dict] = []
         pending: list[tuple] = []
@@ -139,7 +165,6 @@ class CodingMemoryStore:
                 time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else now
             )
             for ci, piece in enumerate(chunk_message(content)):
-                cid = f"{session_id}:{mi}:{ci}:{uuid.uuid4().hex[:8]}"
                 toks = tokenize(piece)
                 pending.append((mi, ci, role, piece, created, toks))
 
@@ -148,7 +173,8 @@ class CodingMemoryStore:
         vecs = dense.encode(pieces) if pieces else None
 
         for k, (mi, ci, role, piece, created, toks) in enumerate(pending):
-            cid = f"{session_id}:{mi}:{ci}:{uuid.uuid4().hex[:8]}"
+            # 确定性 id:request_id 唯一 => 块 id 唯一,配合幂等登记双保险
+            cid = f"{request_id}:{mi}:{ci}"
             vec = vecs[k] if vecs is not None else None
             rows.append(
                 (cid, user_id, session_id, mi, ci, role, piece, created,

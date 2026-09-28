@@ -74,7 +74,7 @@ class SearchResponse(BaseModel):
 @app.post("/add", response_model=AddResponse, dependencies=[Depends(verify_token)])
 def add(req: AddRequest) -> AddResponse:
     messages = [m.model_dump() for m in req.messages]
-    store.add(req.user_id, req.session_id, messages)
+    store.add(req.user_id, req.session_id, messages, request_id=req.request_id)
     return AddResponse(request_id=req.request_id, user_id=req.user_id, session_id=req.session_id)
 
 
