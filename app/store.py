@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import dense
+from . import dense, rerank
 from .chunker import chunk_message
 from .tokenizer import tokenize
 
@@ -267,8 +267,22 @@ class CodingMemoryStore:
                     cand = s if j == i else s * 0.99 - 1e-6 * (rank + 1)
                     picked[j] = max(picked.get(j, 0.0), cand)
 
+            ranked = sorted(picked.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+
+            # gpt-4o-mini 精排:对 RRF 头部候选做一次 listwise 相关性排序;
+            # 失败/关闭时保持 RRF 顺序(永不因重排报错)
+            if rerank.ENABLED and len(ranked) > 1:
+                head = ranked[: rerank.TOP_N]
+                order = rerank.rerank(
+                    query,
+                    [{"idx": n, "content": idx.chunks[j]["content"]} for n, (j, _) in enumerate(head)],
+                )
+                if order is not None:
+                    rest = [n for n in range(len(head)) if n not in set(order)]
+                    ranked = [head[n] for n in order + rest] + ranked[len(head):]
+
             items = []
-            for j, s in sorted(picked.items(), key=lambda kv: kv[1], reverse=True)[:top_k]:
+            for j, s in ranked:
                 c = idx.chunks[j]
                 items.append(
                     {
