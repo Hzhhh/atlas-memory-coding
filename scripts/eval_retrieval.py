@@ -66,7 +66,7 @@ def main() -> None:
         t0 = time.time()
         for repo, grp in exp[exp["repo"].isin(repos)].groupby("repo"):
             for _, row in grp.iterrows():
-                store.add(repo, str(row["instance_id"]), build_messages(row))
+                store.add(repo, str(row["instance_id"]), build_messages(row), request_id=str(row["instance_id"]))
         add_time = time.time() - t0
 
         # 金标块 id 前缀: instance_id 作为 session_id 写入

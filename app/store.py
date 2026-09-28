@@ -29,6 +29,8 @@ SEED_TOP_N = int(os.environ.get("SEED_TOP_N", "20"))     # 每路检索的种子
 NEIGHBOR_SPAN = int(os.environ.get("NEIGHBOR_SPAN", "1"))  # 邻接扩展半径
 MAX_RETURN = int(os.environ.get("MAX_RETURN", "100"))
 RRF_K = int(os.environ.get("RRF_K", "60"))               # RRF 融合常数
+DENSE_FLOOR = float(os.environ.get("DENSE_FLOOR", "0.40"))  # 稠密路噪声门控地板
+QUERY_TITLE_BOOST = int(os.environ.get("QUERY_TITLE_BOOST", "1"))  # 标题 token 重复次数
 
 
 class BM25:
@@ -209,18 +211,30 @@ class CodingMemoryStore:
             if idx.bm25 is None or not idx.chunks:
                 return []
 
+            # 查询构造:标题行(第一行)承载最强信号,BM25 查询里加重一遍
+            qtoks = tokenize(query)
+            if QUERY_TITLE_BOOST > 0 and "\n" in query:
+                title = query.split("\n", 1)[0]
+                qtoks = qtoks + tokenize(title) * QUERY_TITLE_BOOST
+
             # 路径 1:BM25 词面命中
-            bm_scores = idx.bm25.get_scores(tokenize(query))
+            bm_scores = idx.bm25.get_scores(qtoks)
             bm_order = sorted(range(len(idx.chunks)), key=lambda i: bm_scores[i], reverse=True)
             bm_seeds = [i for i in bm_order[:SEED_TOP_N] if bm_scores[i] > 0]
 
-            # 路径 2:稠密语义近邻(可用时)
+            # 路径 2:稠密语义近邻 + 噪声门控:
+            # max sim 低于地板 → 语义上无真匹配,稠密路不出种子(防噪声灌入 Answer)
             dn_seeds: list[int] = []
             if idx.matrix is not None:
                 qv = dense.encode_one(query)
                 if qv is not None:
                     sims = idx.matrix @ qv
-                    dn_seeds = [int(i) for i in np.argsort(-sims)[:SEED_TOP_N]]
+                    if float(sims.max(initial=0.0)) >= DENSE_FLOOR:
+                        dn_seeds = [int(i) for i in np.argsort(-sims)[:SEED_TOP_N]]
+
+            # 双路全空 = 纯噪声查询 → 返回空,不浪费 Answer 上下文
+            if not bm_seeds and not dn_seeds:
+                return []
 
             # RRF 融合:rank-based,对两路分数量纲不敏感
             fused: dict[int, float] = {}
