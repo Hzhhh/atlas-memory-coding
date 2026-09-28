@@ -18,13 +18,17 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 
+import numpy as np
+
+from . import dense
 from .chunker import chunk_message
 from .tokenizer import tokenize
 
 DB_PATH = os.environ.get("AML_DB_PATH", "/data/memory.db")
-SEED_TOP_N = int(os.environ.get("SEED_TOP_N", "20"))     # 种子命中数
+SEED_TOP_N = int(os.environ.get("SEED_TOP_N", "20"))     # 每路检索的种子数
 NEIGHBOR_SPAN = int(os.environ.get("NEIGHBOR_SPAN", "1"))  # 邻接扩展半径
 MAX_RETURN = int(os.environ.get("MAX_RETURN", "100"))
+RRF_K = int(os.environ.get("RRF_K", "60"))               # RRF 融合常数
 
 
 class BM25:
@@ -59,14 +63,20 @@ class BM25:
 
 @dataclass
 class _UserIndex:
-    """单用户的内存态 BM25 索引(dirty 时重建)。"""
+    """单用户的内存态索引:BM25 + 向量矩阵(dirty 时重建)。"""
     chunks: list[dict] = field(default_factory=list)
     bm25: BM25 | None = None
+    matrix: np.ndarray | None = None  # 与 chunks 对齐的 L2 归一化向量
     dirty: bool = True
 
     def rebuild(self) -> None:
         corpus = [c["tokens"] for c in self.chunks]
         self.bm25 = BM25(corpus) if corpus else None
+        vecs = [c.get("vec") for c in self.chunks]
+        if vecs and all(v is not None for v in vecs):
+            self.matrix = np.vstack(vecs)
+        else:
+            self.matrix = None  # 有缺向量 → 该用户退回纯 BM25
         self.dirty = False
 
 
@@ -97,8 +107,13 @@ class CodingMemoryStore:
                        role TEXT,
                        content TEXT NOT NULL,
                        created_at TEXT NOT NULL,
-                       tokens_json TEXT NOT NULL)"""
+                       tokens_json TEXT NOT NULL,
+                       vec BLOB)"""
             )
+            # 旧库迁移:v0.1 无 vec 列
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+            if "vec" not in cols:
+                conn.execute("ALTER TABLE chunks ADD COLUMN vec BLOB")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON chunks(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sess ON chunks(user_id, session_id)")
 
@@ -114,6 +129,7 @@ class CodingMemoryStore:
         """同步写入并提交;返回写入块数。失败抛异常 -> 上层 5xx,不会假成功。"""
         rows: list[tuple] = []
         mem_chunks: list[dict] = []
+        pending: list[tuple] = []
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         for mi, msg in enumerate(messages):
             role = msg.get("role", "user")
@@ -125,20 +141,30 @@ class CodingMemoryStore:
             for ci, piece in enumerate(chunk_message(content)):
                 cid = f"{session_id}:{mi}:{ci}:{uuid.uuid4().hex[:8]}"
                 toks = tokenize(piece)
-                rows.append(
-                    (cid, user_id, session_id, mi, ci, role, piece, created,
-                     json.dumps(toks))
-                )
-                mem_chunks.append(
-                    {"id": cid, "session_id": session_id, "msg_idx": mi,
-                     "chunk_idx": ci, "role": role, "content": piece,
-                     "created_at": created, "tokens": toks}
-                )
+                pending.append((mi, ci, role, piece, created, toks))
+
+        # 本请求所有块一次性批量编码(降级时 vecs=None → 纯 BM25)
+        pieces = [p[3] for p in pending]
+        vecs = dense.encode(pieces) if pieces else None
+
+        for k, (mi, ci, role, piece, created, toks) in enumerate(pending):
+            cid = f"{session_id}:{mi}:{ci}:{uuid.uuid4().hex[:8]}"
+            vec = vecs[k] if vecs is not None else None
+            rows.append(
+                (cid, user_id, session_id, mi, ci, role, piece, created,
+                 json.dumps(toks),
+                 vec.tobytes() if vec is not None else None)
+            )
+            mem_chunks.append(
+                {"id": cid, "session_id": session_id, "msg_idx": mi,
+                 "chunk_idx": ci, "role": role, "content": piece,
+                 "created_at": created, "tokens": toks, "vec": vec}
+            )
         with self._lock:
             with self._conn() as conn:
                 conn.executemany(
-                    "INSERT INTO chunks(id,user_id,session_id,msg_idx,chunk_idx,role,content,created_at,tokens_json)"
-                    " VALUES(?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO chunks(id,user_id,session_id,msg_idx,chunk_idx,role,content,created_at,tokens_json,vec)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
                     rows,
                 )
             # 增量维护内存索引:索引未装载时 _get_index 会连本次新行一起从磁盘读出,
@@ -156,18 +182,35 @@ class CodingMemoryStore:
             idx = self._get_index(user_id)
             if idx.bm25 is None or not idx.chunks:
                 return []
-            scores = idx.bm25.get_scores(tokenize(query))
-            order = sorted(range(len(idx.chunks)), key=lambda i: scores[i], reverse=True)
-            seeds = [i for i in order[:SEED_TOP_N] if scores[i] > 0]
+
+            # 路径 1:BM25 词面命中
+            bm_scores = idx.bm25.get_scores(tokenize(query))
+            bm_order = sorted(range(len(idx.chunks)), key=lambda i: bm_scores[i], reverse=True)
+            bm_seeds = [i for i in bm_order[:SEED_TOP_N] if bm_scores[i] > 0]
+
+            # 路径 2:稠密语义近邻(可用时)
+            dn_seeds: list[int] = []
+            if idx.matrix is not None:
+                qv = dense.encode_one(query)
+                if qv is not None:
+                    sims = idx.matrix @ qv
+                    dn_seeds = [int(i) for i in np.argsort(-sims)[:SEED_TOP_N]]
+
+            # RRF 融合:rank-based,对两路分数量纲不敏感
+            fused: dict[int, float] = {}
+            for rank, i in enumerate(bm_seeds):
+                fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank + 1)
+            for rank, i in enumerate(dn_seeds):
+                fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank + 1)
 
             # 邻接扩展:种子块带上前后邻居,patch 上下文不被切走;
             # 邻居按 0.99 降权,保证种子永远排在它拉进来的邻居之前
             picked: dict[int, float] = {}
-            for rank, i in enumerate(seeds):
+            for rank, (i, s) in enumerate(sorted(fused.items(), key=lambda kv: kv[1], reverse=True)):
                 for j in range(i - NEIGHBOR_SPAN, i + NEIGHBOR_SPAN + 1):
                     if not 0 <= j < len(idx.chunks):
                         continue
-                    cand = scores[i] if j == i else scores[i] * 0.99 - 1e-6 * (rank + 1)
+                    cand = s if j == i else s * 0.99 - 1e-6 * (rank + 1)
                     picked[j] = max(picked.get(j, 0.0), cand)
 
             items = []
@@ -189,17 +232,38 @@ class CodingMemoryStore:
             idx = _UserIndex()
             with self._conn() as conn:
                 for row in conn.execute(
-                    "SELECT id,session_id,msg_idx,chunk_idx,role,content,created_at,tokens_json"
+                    "SELECT id,session_id,msg_idx,chunk_idx,role,content,created_at,tokens_json,vec"
                     " FROM chunks WHERE user_id=? ORDER BY session_id,msg_idx,chunk_idx",
                     (user_id,),
                 ):
+                    vec = (
+                        np.frombuffer(row[8], dtype=np.float32)
+                        if row[8] is not None
+                        else None
+                    )
                     idx.chunks.append(
                         {
                             "id": row[0], "session_id": row[1], "msg_idx": row[2],
                             "chunk_idx": row[3], "role": row[4], "content": row[5],
                             "created_at": row[6], "tokens": json.loads(row[7]),
+                            "vec": vec,
                         }
                     )
+            # 旧数据补向量:仅当存在缺失且模型可用时批量编码(自愈迁移)
+            missing = [i for i, c in enumerate(idx.chunks) if c.get("vec") is None]
+            if missing and dense.available():
+                vecs = dense.encode([idx.chunks[i]["content"] for i in missing])
+                if vecs is not None:
+                    for k, i in enumerate(missing):
+                        idx.chunks[i]["vec"] = vecs[k]
+                    with self._conn() as conn:
+                        conn.executemany(
+                            "UPDATE chunks SET vec=? WHERE id=?",
+                            [
+                                (idx.chunks[i]["vec"].tobytes(), idx.chunks[i]["id"])
+                                for i in missing
+                            ],
+                        )
             self._idx[user_id] = idx
         if idx.dirty:
             idx.rebuild()
