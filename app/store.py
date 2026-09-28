@@ -116,13 +116,26 @@ class CodingMemoryStore:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
             if "vec" not in cols:
                 conn.execute("ALTER TABLE chunks ADD COLUMN vec BLOB")
-            # Add 幂等登记表:平台重试会带同一 request_id,重复请求直接视为成功
+            # Add 幂等登记表:平台重试会带同一 request_id,重复请求直接视为成功。
+            # 关键:request_id 只在 user_id 内唯一(平台对每个样本用独立 user_id、
+            # 样本内 request_id 从头编号),主键必须复合,否则跨样本吞写。
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS adds(
-                       request_id TEXT PRIMARY KEY,
                        user_id TEXT NOT NULL,
-                       created_at TEXT NOT NULL)"""
+                       request_id TEXT NOT NULL,
+                       created_at TEXT NOT NULL,
+                       PRIMARY KEY(user_id, request_id))"""
             )
+            # 迁移:旧版主键只有 request_id -> 重建为复合主键
+            pk = [r[1] for r in conn.execute("PRAGMA table_info(adds)") if r[5]]
+            if pk == ["request_id"]:
+                conn.execute(
+                    "CREATE TABLE adds_new(user_id TEXT NOT NULL, request_id TEXT NOT NULL,"
+                    " created_at TEXT NOT NULL, PRIMARY KEY(user_id, request_id))"
+                )
+                conn.execute("INSERT OR IGNORE INTO adds_new SELECT user_id, request_id, created_at FROM adds")
+                conn.execute("DROP TABLE adds")
+                conn.execute("ALTER TABLE adds_new RENAME TO adds")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON chunks(user_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sess ON chunks(user_id, session_id)")
 
@@ -175,8 +188,9 @@ class CodingMemoryStore:
         vecs = dense.encode(pieces) if pieces else None
 
         for k, (mi, ci, role, piece, created, toks) in enumerate(pending):
-            # 确定性 id:request_id 唯一 => 块 id 唯一,配合幂等登记双保险
-            cid = f"{request_id}:{mi}:{ci}"
+            # 确定性 id:user + request_id 域内唯一(跨用户同 request_id 不冲突),
+            # 与幂等登记表的双保险保持同一作用域
+            cid = f"{user_id}:{request_id}:{mi}:{ci}"
             vec = vecs[k] if vecs is not None else None
             rows.append(
                 (cid, user_id, session_id, mi, ci, role, piece, created,

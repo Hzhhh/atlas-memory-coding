@@ -44,7 +44,7 @@ def main() -> None:
     exp_ids, rel_ids = set(exp["instance_id"]), set(rel["instance_id"])
     links = ship[ship["related_instance_id"].isin(rel_ids) & ship["experience_instance_id"].isin(exp_ids)]
     if args.limit:
-        links = links.head(args.limit)
+        links = links.sample(n=min(args.limit, len(links)), random_state=42)  # 随机抽样,避开表序聚类
 
     all_repos = sorted(set(exp["repo"]))
     with tempfile.TemporaryDirectory() as td:
@@ -61,9 +61,14 @@ def main() -> None:
             repo = rid.rsplit("-", 1)[0].replace("__", "/")
             # 每次换 user_id 隔离,避免上一个 query 的噪声累积 -> 每轮新建临时 user
             user = f"q{li}"
-            # 相关侧:gold 所在仓库全部经验
+            # 相关侧:gold 经验任务必须入库(关联可跨仓库,只灌 related 所在仓库会漏金标),
+            # 外加 related 仓库全部经验作为同仓库干扰项
+            grow = exp[exp["instance_id"] == gid]
+            if not grow.empty:
+                store.add(user, gid, build_messages(grow.iloc[0]), request_id=gid)
             for _, row in exp[exp["repo"] == repo].iterrows():
-                store.add(user, str(row["instance_id"]), build_messages(row), request_id=str(row["instance_id"]))
+                if row["instance_id"] != gid:
+                    store.add(user, str(row["instance_id"]), build_messages(row), request_id=str(row["instance_id"]))
             gold_repo = repo
             # 噪声侧:抽 N 个其他仓库的经验灌进同一 user
             other = [r for r in all_repos if r != gold_repo]
@@ -75,10 +80,10 @@ def main() -> None:
             qrow = rel[rel["instance_id"] == rid]
             query = str(qrow.iloc[0]["problem_statement"])[:6000]
             res = store.search(user, query, top_k=args.top_k)
-            gold_prefix = f"{gid}:"
+            gold_prefix = f"{user}:{gid}:"
             hit = next((i for i, r in enumerate(res) if r["id"].startswith(gold_prefix)), None)
             hit_ranks.append(hit)
-            noise_prefixes = tuple(f"noise-{nr}-" for nr in noise_repos)
+            noise_prefixes = tuple(f"{user}:noise-{nr}-" for nr in noise_repos)
             leak = sum(1 for r in res if r["id"].startswith(noise_prefixes))
             leak_counts.append(leak)
             ret_counts.append(len(res))

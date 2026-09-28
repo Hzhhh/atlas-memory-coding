@@ -82,7 +82,7 @@ def main() -> None:
             t1 = time.time()
             res = store.search(repo, query, top_k=args.top_k)
             search_time += time.time() - t1
-            gold_prefix = f"{gold_exp}:"
+            gold_prefix = f"{repo}:{gold_exp}:"
             hit = next((i for i, r in enumerate(res) if r["id"].startswith(gold_prefix)), None)
             rank_hits.append(hit)
 
