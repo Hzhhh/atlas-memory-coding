@@ -13,11 +13,13 @@
 | `app/tokenizer.py` | 代码感知分词:camelCase/snake_case 拆分、文件路径保真、错误类型名双写、轻量词干 |
 | `app/chunker.py` | 消息级分块:段落贪心聚合 ~700 字符,大 patch 按行滑窗不截断 |
 | `app/store.py` | SQLite(WAL) 同步持久化 + Lucene 风格 BM25(恒正 IDF) + 种子邻接扩展检索 |
+| `app/rerank.py` | Search 侧 gpt-4o-mini listwise 重排(OpenRouter 路由),失败自动回退 RRF 顺序 |
 | `app/main.py` | FastAPI 契约端点,`Authorization: Token` 鉴权 |
 
 契约要点:
 - **Add 同步**:写入并落盘后才返回 200,`success=true`,原样回显 `request_id`
 - **Search 只返回记忆证据**(`content` 原文),不生成答案;按相关性降序;尊重 `top_k`
+- **Search 侧 LLM = gpt-4o-mini**(仅用于重排,经 OpenRouter 路由),符合开源组模型预期;嵌入用本地 bge-small(33M 参数,CPU);API 不可用时自动降级,服务不中断
 - **user_id 严格隔离**(表和索引都按 user_id 分域)
 - `/health` 免鉴权,供平台探测
 
